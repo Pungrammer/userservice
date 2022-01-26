@@ -1,10 +1,11 @@
 package userservice
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
-	"strings"
 	"time"
+	"userservice/requests"
 
 	"github.com/xyproto/permissionbolt"
 	"github.com/xyproto/pinterface"
@@ -36,74 +37,114 @@ func (ph *permissionHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 }
 
 func main() {
+	defer log.Printf("Shutting down")
+
 	mux := http.NewServeMux()
 
 	// New permissionbolt middleware
 	perm, err := permissionbolt.New()
 	if err != nil {
-		log.Fatal("Could not open Bolt database")
+		log.Fatal("Cannot init middleware", err)
+		return
 	}
 
 	// Blank slate, no default permissions
 	//perm.Clear()
 
-	// Get the userstate, used in the handlers below
-	userstate := perm.UserState()
+	// Get the middleware, used in the handlers below
+	middleware := perm.UserState()
+	err = middleware.SetPasswordAlgo("bcrypt")
+	if err != nil {
+		log.Fatal("Cannot set password algorithm")
+		return
+	}
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		log.Printf("Has user bob: %v\n", userstate.HasUser("bob"))
-		log.Printf("Logged in on server: %v\n", userstate.IsLoggedIn("bob"))
-		log.Printf("Is confirmed: %v\n", userstate.IsConfirmed("bob"))
-		log.Printf("Username stored in cookies (or blank): %v\n", userstate.Username(req))
-		log.Printf("Current user is logged in, has a valid cookie and *user rights*: %v\n", userstate.UserRights(req))
-		log.Printf("Current user is logged in, has a valid cookie and *admin rights*: %v\n", userstate.AdminRights(req))
-		log.Printf("\nTry: /register, /confirm, /remove, /login, /logout, /makeadmin, /clear, /data and /admin")
+	//TODO: remove this endpoint
+	mux.HandleFunc("/info", func(w http.ResponseWriter, req *http.Request) {
+		username, _ := middleware.UsernameCookie(req) //ignore error, as it only tells us that there was no cookie
+		if username != "" {
+			log.Printf("User '%s' is logged in", username)
+			log.Printf("User '%s' has user rights?: %v", username, middleware.UserRights(req))
+			log.Printf("User '%s' has admin rights?: %v", username, middleware.AdminRights(req))
+		} else {
+			log.Printf("User is not logged in")
+		}
 	})
 
 	mux.HandleFunc("/register", func(w http.ResponseWriter, req *http.Request) {
-		userstate.AddUser("bob", "hunter1", "bob@zombo.com")
-		log.Printf("User bob was created: %v\n", userstate.HasUser("bob"))
+		registerRequest := requests.Register{}
+		err := json.NewDecoder(req.Body).Decode(&registerRequest)
+		if err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		middleware.AddUser(registerRequest.Username, registerRequest.Password, "")
+		// There won't be a confirmation process
+		middleware.MarkConfirmed(registerRequest.Username)
+		log.Printf("User %s was created", registerRequest.Username)
 	})
 
-	mux.HandleFunc("/confirm", func(w http.ResponseWriter, req *http.Request) {
-		userstate.MarkConfirmed("bob")
-		log.Printf("User bob was confirmed: %v\n", userstate.IsConfirmed("bob"))
-	})
-
-	mux.HandleFunc("/remove", func(w http.ResponseWriter, req *http.Request) {
-		userstate.RemoveUser("bob")
-		log.Printf("User bob was removed: %v\n", !userstate.HasUser("bob"))
+	mux.HandleFunc("/admin/remove", func(w http.ResponseWriter, req *http.Request) {
+		//middleware.RemoveUser("bob")
+		//log.Printf("User bob was removed: %v\n", !middleware.HasUser("bob"))
+		http.Error(w, "Not implemented", http.StatusNotImplemented)
 	})
 
 	mux.HandleFunc("/login", func(w http.ResponseWriter, req *http.Request) {
-		userstate.Login(w, "bob")
-		log.Printf("bob is now logged in: %v\n", userstate.IsLoggedIn("bob"))
+		switch req.Method {
+		case "POST":
+			loginRequest := requests.Login{}
+			err := json.NewDecoder(req.Body).Decode(&loginRequest)
+			if err != nil {
+				http.Error(w, "Malformed input", http.StatusBadRequest)
+				return
+			}
+
+			if middleware.CorrectPassword(loginRequest.Username, loginRequest.Password) {
+				err := middleware.Login(w, loginRequest.Username)
+				if err != nil {
+					log.Println("Cannot requests user: ", err)
+					http.Error(w, "Internal Server error", http.StatusInternalServerError)
+					return
+				}
+				log.Printf("Logged in user %s", loginRequest.Username)
+			} else {
+				http.Error(w, "Wrong password", http.StatusForbidden)
+				return
+			}
+		default:
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
 	})
 
 	mux.HandleFunc("/logout", func(w http.ResponseWriter, req *http.Request) {
-		userstate.Logout("bob")
-		log.Printf("bob is now logged out: %v\n", !userstate.IsLoggedIn("bob"))
+		username, err := middleware.UsernameCookie(req)
+		if err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+		}
+
+		middleware.Logout(username)
+		log.Printf("%s is now logged out: %v\n", username, !middleware.IsLoggedIn(username))
 	})
 
-	mux.HandleFunc("/makeadmin", func(w http.ResponseWriter, req *http.Request) {
-		userstate.SetAdminStatus("bob")
-		log.Printf("bob is now administrator: %v\n", userstate.IsAdmin("bob"))
-	})
-
-	mux.HandleFunc("/clear", func(w http.ResponseWriter, req *http.Request) {
-		userstate.ClearCookie(w)
-		log.Printf("Clearing cookie")
+	mux.HandleFunc("/admin/makeadmin", func(w http.ResponseWriter, req *http.Request) {
+		//middleware.SetAdminStatus("bob")
+		//log.Printf("bob is now administrator: %v\n", middleware.IsAdmin("bob"))
+		http.Error(w, "Not implemented", http.StatusNotImplemented)
 	})
 
 	mux.HandleFunc("/data", func(w http.ResponseWriter, req *http.Request) {
-		log.Printf("user page that only logged in users must see!")
+		//log.Printf("user page that only logged in users must see!")
+		http.Error(w, "Not implemented", http.StatusNotImplemented)
 	})
 
 	mux.HandleFunc("/admin", func(w http.ResponseWriter, req *http.Request) {
-		log.Printf("super secret information that only logged in administrators must see!\n\n")
-		if usernames, err := userstate.AllUsernames(); err == nil {
-			log.Printf("list of all users: " + strings.Join(usernames, ", "))
-		}
+		//log.Printf("super secret information that only logged in administrators must see!\n\n")
+		//if usernames, err := middleware.AllUsernames(); err == nil {
+		//	log.Printf("list of all users: " + strings.Join(usernames, ", "))
+		//}
+		http.Error(w, "Not implemented", http.StatusNotImplemented)
 	})
 
 	// Custom handler for when permissions are denied
@@ -113,7 +154,7 @@ func main() {
 
 	// Configure the HTTP server and permissionHandler struct
 	s := &http.Server{
-		Addr:           ":3000",
+		Addr:           ":3000", //TODO: Make configurable
 		Handler:        &permissionHandler{perm, mux},
 		ReadTimeout:    10 * time.Second,
 		WriteTimeout:   10 * time.Second,
@@ -123,5 +164,8 @@ func main() {
 	log.Println("Listening for requests on port 3000")
 
 	// Start listening
-	s.ListenAndServe()
+	err = s.ListenAndServe()
+	if err != nil {
+		log.Fatal("Failed to start server: ", err)
+	}
 }
